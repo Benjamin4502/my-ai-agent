@@ -1,4 +1,4 @@
-// Stage 8: Adds document summarization — send the bot a .docx file, it replies with a summary
+// Stage 9: Adds reminders — "/remind <minutes> <message>"
 
 const { Telegraf } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -20,6 +20,16 @@ async function setupDatabase() {
       chat_id TEXT NOT NULL,
       role TEXT NOT NULL,
       content TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reminders (
+      id SERIAL PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      message TEXT NOT NULL,
+      remind_at TIMESTAMP NOT NULL,
+      sent BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -53,9 +63,71 @@ async function askClaude(messages) {
     .join('\n');
 }
 
-bot.start((ctx) => ctx.reply('Hello! Your AI agent is alive, remembers our chat, and can now summarize documents. Send me a question or a .docx file.'));
+bot.start((ctx) => ctx.reply(
+  "Hello! Your AI agent is alive, remembers our chat, and can:\n" +
+  "- Summarize .docx documents you send\n" +
+  "- Set reminders: /remind <minutes> <message>\n" +
+  "  e.g. /remind 30 Call the printing vendor\n" +
+  "- List reminders: /reminders\n" +
+  "Ask me anything else too."
+));
 
-// Handle plain text messages (existing behavior)
+// /remind <minutes> <message>
+bot.command('remind', async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  const parts = ctx.message.text.split(' ').slice(1); // remove "/remind"
+  const minutes = parseInt(parts[0], 10);
+  const message = parts.slice(1).join(' ');
+
+  if (!minutes || !message) {
+    return ctx.reply('Usage: /remind <minutes> <message>\nExample: /remind 30 Call the printing vendor');
+  }
+
+  const remindAt = new Date(Date.now() + minutes * 60 * 1000);
+
+  await pool.query(
+    'INSERT INTO reminders (chat_id, message, remind_at) VALUES ($1, $2, $3)',
+    [chatId, message, remindAt]
+  );
+
+  ctx.reply(`Got it — I'll remind you in ${minutes} minute(s): "${message}"`);
+});
+
+// /reminders - list upcoming ones
+bot.command('reminders', async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  const result = await pool.query(
+    'SELECT message, remind_at FROM reminders WHERE chat_id = $1 AND sent = FALSE ORDER BY remind_at ASC',
+    [chatId]
+  );
+
+  if (result.rows.length === 0) {
+    return ctx.reply('You have no pending reminders.');
+  }
+
+  const list = result.rows
+    .map((r) => `- ${r.message} (at ${new Date(r.remind_at).toLocaleString()})`)
+    .join('\n');
+  ctx.reply(`Your pending reminders:\n${list}`);
+});
+
+// Check every 30 seconds for due reminders and send them
+async function checkReminders() {
+  try {
+    const due = await pool.query(
+      'SELECT id, chat_id, message FROM reminders WHERE sent = FALSE AND remind_at <= NOW()'
+    );
+    for (const reminder of due.rows) {
+      await bot.telegram.sendMessage(reminder.chat_id, `⏰ Reminder: ${reminder.message}`);
+      await pool.query('UPDATE reminders SET sent = TRUE WHERE id = $1', [reminder.id]);
+    }
+  } catch (err) {
+    console.error('Reminder check error:', err);
+  }
+}
+setInterval(checkReminders, 30 * 1000);
+
+// Handle plain text messages
 bot.on('text', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const userMessage = ctx.message.text;
@@ -92,8 +164,6 @@ bot.on('document', async (ctx) => {
     const buffer = Buffer.from(arrayBuffer);
 
     const { value: extractedText } = await mammoth.extractRawText({ buffer });
-
-    // Keep prompts a reasonable size
     const trimmedText = extractedText.slice(0, 15000);
 
     const summary = await askClaude([
@@ -115,7 +185,7 @@ bot.on('document', async (ctx) => {
 
 setupDatabase().then(() => {
   bot.launch();
-  console.log('Bot is running with Anthropic API, database, and document summarization...');
+  console.log('Bot is running with Anthropic API, database, document summarization, and reminders...');
 });
 
 const PORT = process.env.PORT || 3000;
