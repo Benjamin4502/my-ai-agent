@@ -1,7 +1,9 @@
-// Stage 4: Connected to Anthropic API — real AI replies, not echo
+// Stage 5: Ready for Render deployment — includes a tiny HTTP server
+// so Render's free Web Service tier keeps the app alive.
 
 const { Telegraf } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
+const http = require('http');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -10,8 +12,6 @@ bot.start((ctx) => ctx.reply('Hello! Your AI agent is alive and now connected to
 
 bot.on('text', async (ctx) => {
   const userMessage = ctx.message.text;
-
-  // Let the user know it's thinking (helps on slower connections)
   await ctx.sendChatAction('typing');
 
   try {
@@ -29,12 +29,18 @@ bot.on('text', async (ctx) => {
     ctx.reply(reply || "I didn't get a text response back, try rephrasing.");
   } catch (err) {
     console.error('Anthropic API error:', err);
-    ctx.reply('Something went wrong reaching Claude. Check the Shell logs.');
+    ctx.reply('Something went wrong reaching Claude. Check the logs.');
   }
 });
 
 bot.launch();
 console.log('Bot is running with Anthropic API connected...');
+
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is alive');
+}).listen(PORT, () => console.log(`Health check server on port ${PORT}`));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
