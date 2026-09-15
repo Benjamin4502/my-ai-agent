@@ -1,9 +1,10 @@
-// Stage 6: Now with memory — stores and recalls conversation history per user
+// Stage 8: Adds document summarization — send the bot a .docx file, it replies with a summary
 
 const { Telegraf } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
 const http = require('http');
 const { Pool } = require('pg');
+const mammoth = require('mammoth');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -40,8 +41,21 @@ async function getHistory(chatId, limit = 10) {
   return result.rows.reverse();
 }
 
-bot.start((ctx) => ctx.reply('Hello! Your AI agent is alive, connected to Claude, and now remembers our conversation. Ask me anything.'));
+async function askClaude(messages) {
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1000,
+    messages,
+  });
+  return response.content
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n');
+}
 
+bot.start((ctx) => ctx.reply('Hello! Your AI agent is alive, remembers our chat, and can now summarize documents. Send me a question or a .docx file.'));
+
+// Handle plain text messages (existing behavior)
 bot.on('text', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const userMessage = ctx.message.text;
@@ -50,18 +64,7 @@ bot.on('text', async (ctx) => {
   try {
     await saveMessage(chatId, 'user', userMessage);
     const history = await getHistory(chatId, 10);
-
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1000,
-      messages: history.map((row) => ({ role: row.role, content: row.content })),
-    });
-
-    const reply = response.content
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n');
-
+    const reply = await askClaude(history.map((row) => ({ role: row.role, content: row.content })));
     await saveMessage(chatId, 'assistant', reply);
     ctx.reply(reply || "I didn't get a text response back, try rephrasing.");
   } catch (err) {
@@ -70,9 +73,49 @@ bot.on('text', async (ctx) => {
   }
 });
 
+// Handle uploaded documents (.docx summarization)
+bot.on('document', async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  const fileName = ctx.message.document.file_name || '';
+
+  if (!fileName.toLowerCase().endsWith('.docx')) {
+    return ctx.reply('For now I can only read .docx Word documents. PDF support is coming later.');
+  }
+
+  try {
+    await ctx.reply('Got your document — reading it now...');
+    await ctx.sendChatAction('typing');
+
+    const fileLink = await ctx.telegram.getFileLink(ctx.message.document.file_id);
+    const response = await fetch(fileLink.href);
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    const { value: extractedText } = await mammoth.extractRawText({ buffer });
+
+    // Keep prompts a reasonable size
+    const trimmedText = extractedText.slice(0, 15000);
+
+    const summary = await askClaude([
+      {
+        role: 'user',
+        content: `Summarize the following document. Give the title/topic, then key points as a short list, and a one-line takeaway.\n\nDocument:\n${trimmedText}`,
+      },
+    ]);
+
+    await saveMessage(chatId, 'user', `[Uploaded document: ${fileName}]`);
+    await saveMessage(chatId, 'assistant', summary);
+
+    ctx.reply(summary);
+  } catch (err) {
+    console.error('Document processing error:', err);
+    ctx.reply('Something went wrong reading that document. Make sure it is a valid .docx file.');
+  }
+});
+
 setupDatabase().then(() => {
   bot.launch();
-  console.log('Bot is running with Anthropic API and database connected...');
+  console.log('Bot is running with Anthropic API, database, and document summarization...');
 });
 
 const PORT = process.env.PORT || 3000;
