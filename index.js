@@ -1,24 +1,60 @@
-// Stage 5: Ready for Render deployment — includes a tiny HTTP server
-// so Render's free Web Service tier keeps the app alive.
+// Stage 6: Now with memory — stores and recalls conversation history per user
 
 const { Telegraf } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
 const http = require('http');
+const { Pool } = require('pg');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-bot.start((ctx) => ctx.reply('Hello! Your AI agent is alive and now connected to Claude. Ask me anything.'));
+async function setupDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id SERIAL PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('Database ready.');
+}
+
+async function saveMessage(chatId, role, content) {
+  await pool.query(
+    'INSERT INTO conversations (chat_id, role, content) VALUES ($1, $2, $3)',
+    [chatId, role, content]
+  );
+}
+
+async function getHistory(chatId, limit = 10) {
+  const result = await pool.query(
+    'SELECT role, content FROM conversations WHERE chat_id = $1 ORDER BY id DESC LIMIT $2',
+    [chatId, limit]
+  );
+  return result.rows.reverse();
+}
+
+bot.start((ctx) => ctx.reply('Hello! Your AI agent is alive, connected to Claude, and now remembers our conversation. Ask me anything.'));
 
 bot.on('text', async (ctx) => {
+  const chatId = String(ctx.chat.id);
   const userMessage = ctx.message.text;
   await ctx.sendChatAction('typing');
 
   try {
+    await saveMessage(chatId, 'user', userMessage);
+    const history = await getHistory(chatId, 10);
+
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1000,
-      messages: [{ role: 'user', content: userMessage }],
+      messages: history.map((row) => ({ role: row.role, content: row.content })),
     });
 
     const reply = response.content
@@ -26,15 +62,18 @@ bot.on('text', async (ctx) => {
       .map((block) => block.text)
       .join('\n');
 
+    await saveMessage(chatId, 'assistant', reply);
     ctx.reply(reply || "I didn't get a text response back, try rephrasing.");
   } catch (err) {
-    console.error('Anthropic API error:', err);
-    ctx.reply('Something went wrong reaching Claude. Check the logs.');
+    console.error('Error:', err);
+    ctx.reply('Something went wrong. Check the logs.');
   }
 });
 
-bot.launch();
-console.log('Bot is running with Anthropic API connected...');
+setupDatabase().then(() => {
+  bot.launch();
+  console.log('Bot is running with Anthropic API and database connected...');
+});
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
