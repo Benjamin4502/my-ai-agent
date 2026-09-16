@@ -90,8 +90,8 @@ bot.start((ctx) => ctx.reply(
   "  e.g. /signal SOL\n" +
   "- Turn on watchlist alerts: /alertson (off: /alertsoff)\n" +
   "- See the watchlist: /watchlist\n" +
-  "- Backtest a strategy: /backtest <symbol> [days]\n" +
-  "  e.g. /backtest SOL 90\n" +
+  "- Backtest a leveraged strategy: /backtest <symbol> [days] [target%]\n" +
+  "  e.g. /backtest SOL 90 100 (10x leverage, 100% profit target)\n" +
   "Ask me anything else too."
 ));
 
@@ -142,6 +142,14 @@ const COINGECKO_IDS = {
   TRX: 'tron', LINK: 'chainlink', AVAX: 'avalanche-2', MATIC: 'matic-network',
   DOT: 'polkadot', LTC: 'litecoin', SHIB: 'shiba-inu', NOM: 'onomy-protocol',
   MYX: 'myx-finance',
+  // AI-narrative coins
+  FET: 'fetch-ai', RNDR: 'render-token', TAO: 'bittensor', AGIX: 'singularitynet',
+  WLD: 'worldcoin', ARKM: 'arkham', AKT: 'akash-network', GRT: 'the-graph',
+  OCEAN: 'ocean-protocol',
+  // Zcash (confirmed real, currently ~$1,100+)
+  ZEC: 'zcash',
+  // Smaller/newer ones — left for the search fallback below to resolve,
+  // added here only if a confirmed exact CoinGecko ID is known
 };
 
 async function resolveCoinGeckoId(base) {
@@ -303,19 +311,21 @@ bot.command('backtest', async (ctx) => {
   const parts = ctx.message.text.split(' ').slice(1);
   const symbol = (parts[0] || '').toUpperCase();
   const days = Math.min(parseInt(parts[1], 10) || 90, 365);
+  const targetPct = [50, 100, 150, 200].includes(parseInt(parts[2], 10)) ? parseInt(parts[2], 10) : 100;
+  const leverage = 10; // matches the stated trading plan
 
   if (!symbol) {
-    return ctx.reply('Usage: /backtest <symbol> [days]\nExample: /backtest SOL 90');
+    return ctx.reply('Usage: /backtest <symbol> [days] [target%]\nTarget must be 50, 100, 150, or 200 (default 100)\nExample: /backtest SOL 90 100');
   }
 
   const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
 
   try {
-    await ctx.reply(`Backtesting ${base} over the last ${days} days...`);
+    await ctx.reply(`Backtesting ${base} over the last ${days} days — ${leverage}x leverage, ${targetPct}% take-profit target...`);
 
     const coinId = await resolveCoinGeckoId(base);
     if (!coinId) {
-      return ctx.reply(`Couldn't find data for "${symbol}".`);
+      return ctx.reply(`Couldn't find data for "${symbol}". Small/new tokens may not be listed on CoinGecko yet.`);
     }
 
     const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}&interval=daily`;
@@ -329,52 +339,66 @@ bot.command('backtest', async (ctx) => {
     const closes = data.prices.map((p) => p[1]);
     const rsiSeries = calculateRSISeries(closes, 14);
 
-    let position = null; // { entryPrice }
+    // Price move needed for a given leveraged return: return% = priceMove% * leverage
+    const targetPriceMove = targetPct / leverage / 100; // e.g. 100% target at 10x = 10% price move
+    const liquidationPriceMove = -1 / leverage; // e.g. at 10x, a -10% price move wipes the margin
+
     const trades = [];
+    let liquidations = 0;
+    let position = null;
 
     for (let i = 1; i < closes.length; i++) {
       const rsi = rsiSeries[i];
       const prevRsi = rsiSeries[i - 1];
       if (rsi === null || prevRsi === null) continue;
 
-      // Enter: RSI crosses down into oversold (<=30) while flat
       if (!position && prevRsi > 30 && rsi <= 30) {
         position = { entryPrice: closes[i], entryIndex: i };
+        continue;
       }
-      // Exit: RSI crosses up into overbought (>=70) while holding
-      else if (position && prevRsi < 70 && rsi >= 70) {
-        const exitPrice = closes[i];
-        const returnPct = ((exitPrice - position.entryPrice) / position.entryPrice) * 100;
-        trades.push(returnPct);
-        position = null;
+
+      if (position) {
+        const priceMove = (closes[i] - position.entryPrice) / position.entryPrice;
+
+        if (priceMove <= liquidationPriceMove) {
+          trades.push(-100); // full margin lost
+          liquidations++;
+          position = null;
+        } else if (priceMove >= targetPriceMove) {
+          trades.push(targetPct); // take-profit hit
+          position = null;
+        }
+        // otherwise: still holding, keep walking forward
       }
     }
 
     let openNote = '';
     if (position) {
-      const unrealizedPct = ((closes[closes.length - 1] - position.entryPrice) / position.entryPrice) * 100;
-      openNote = `\n(Still holding an open position from this strategy: ${unrealizedPct >= 0 ? '+' : ''}${unrealizedPct.toFixed(2)}% unrealized)`;
+      const unrealizedMove = (closes[closes.length - 1] - position.entryPrice) / position.entryPrice;
+      const unrealizedReturn = (unrealizedMove * leverage * 100).toFixed(1);
+      openNote = `\n(Still holding an open position: ${unrealizedReturn >= 0 ? '+' : ''}${unrealizedReturn}% on margin, unrealized)`;
     }
 
     if (trades.length === 0) {
-      return ctx.reply(`No completed buy/sell cycles for ${base} in the last ${days} days using this RSI strategy.${openNote}\n\n⚠️ Not financial advice — a backtest on limited history doesn't guarantee future results.`);
+      return ctx.reply(`No completed entries for ${base} in the last ${days} days using this RSI + take-profit strategy.${openNote}\n\n⚠️ Not financial advice.`);
     }
 
     const wins = trades.filter((t) => t > 0).length;
     const winRate = ((wins / trades.length) * 100).toFixed(1);
     const totalReturn = trades.reduce((sum, t) => sum + t, 0);
-    const avgReturn = (totalReturn / trades.length).toFixed(2);
+    const avgReturn = (totalReturn / trades.length).toFixed(1);
 
     ctx.reply(
-      `📊 Backtest: ${base} — RSI(14) oversold/overbought strategy, last ${days} days\n\n` +
-      `Completed trades: ${trades.length}\n` +
+      `📊 Leveraged backtest: ${base} — ${leverage}x, ${targetPct}% take-profit target, last ${days} days\n\n` +
+      `Trades: ${trades.length} (${liquidations} liquidated)\n` +
       `Win rate: ${winRate}% (${wins}/${trades.length})\n` +
-      `Total return (summed): ${totalReturn >= 0 ? '+' : ''}${totalReturn.toFixed(2)}%\n` +
+      `Total return on margin (summed): ${totalReturn >= 0 ? '+' : ''}${totalReturn.toFixed(1)}%\n` +
       `Average return per trade: ${avgReturn >= 0 ? '+' : ''}${avgReturn}%` +
       openNote +
-      `\n\n⚠️ This is a simplified backtest (no fees/slippage included) on limited history — not financial advice, and past results don't guarantee future ones.`
+      `\n\n⚠️ Simplified simulation — no fees, funding rates, or slippage included. At ${leverage}x, a ${Math.abs(liquidationPriceMove * 100).toFixed(1)}% adverse price move wipes the trade's margin. Past results don't guarantee future ones — this is not financial advice.`
     );
   } catch (err) {
+
     console.error('Backtest error:', err);
     ctx.reply('Something went wrong running that backtest. Try again shortly.');
   }
@@ -382,7 +406,14 @@ bot.command('backtest', async (ctx) => {
 
 // ---- Automatic watchlist alerts (Stage 13) ----
 
-const WATCHLIST = ['SOL', 'NOM', 'MYX'];
+const WATCHLIST = [
+  // Original
+  'SOL', 'NOM', 'MYX',
+  // AI narrative
+  'FET', 'RNDR', 'TAO', 'AGIX', 'WLD', 'ARKM', 'AKT', 'GRT', 'OCEAN',
+  // Requested pairs
+  'JCT', 'LTC', 'MUBARAK', 'XPIN', 'ZEC', 'CLCLX', 'SIREN', 'SKR',
+];
 
 bot.command('alertson', async (ctx) => {
   const chatId = String(ctx.chat.id);
@@ -574,3 +605,4 @@ http.createServer((req, res) => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
