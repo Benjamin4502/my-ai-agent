@@ -1,4 +1,4 @@
-// Stage 9: Adds reminders — "/remind <minutes> <message>"
+// Stage 10 fix: added crash protection so one error doesn't kill the whole bot
 
 const { Telegraf } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -72,10 +72,9 @@ bot.start((ctx) => ctx.reply(
   "Ask me anything else too."
 ));
 
-// /remind <minutes> <message>
 bot.command('remind', async (ctx) => {
   const chatId = String(ctx.chat.id);
-  const parts = ctx.message.text.split(' ').slice(1); // remove "/remind"
+  const parts = ctx.message.text.split(' ').slice(1);
   const minutes = parseInt(parts[0], 10);
   const message = parts.slice(1).join(' ');
 
@@ -93,7 +92,6 @@ bot.command('remind', async (ctx) => {
   ctx.reply(`Got it — I'll remind you in ${minutes} minute(s): "${message}"`);
 });
 
-// /reminders - list upcoming ones
 bot.command('reminders', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const result = await pool.query(
@@ -111,15 +109,18 @@ bot.command('reminders', async (ctx) => {
   ctx.reply(`Your pending reminders:\n${list}`);
 });
 
-// Check every 30 seconds for due reminders and send them
 async function checkReminders() {
   try {
     const due = await pool.query(
       'SELECT id, chat_id, message FROM reminders WHERE sent = FALSE AND remind_at <= NOW()'
     );
     for (const reminder of due.rows) {
-      await bot.telegram.sendMessage(reminder.chat_id, `⏰ Reminder: ${reminder.message}`);
-      await pool.query('UPDATE reminders SET sent = TRUE WHERE id = $1', [reminder.id]);
+      try {
+        await bot.telegram.sendMessage(reminder.chat_id, `⏰ Reminder: ${reminder.message}`);
+        await pool.query('UPDATE reminders SET sent = TRUE WHERE id = $1', [reminder.id]);
+      } catch (sendErr) {
+        console.error('Failed to send one reminder:', sendErr);
+      }
     }
   } catch (err) {
     console.error('Reminder check error:', err);
@@ -127,25 +128,27 @@ async function checkReminders() {
 }
 setInterval(checkReminders, 30 * 1000);
 
-// Handle plain text messages
 bot.on('text', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const userMessage = ctx.message.text;
-  await ctx.sendChatAction('typing');
 
   try {
+    await ctx.sendChatAction('typing');
     await saveMessage(chatId, 'user', userMessage);
     const history = await getHistory(chatId, 10);
     const reply = await askClaude(history.map((row) => ({ role: row.role, content: row.content })));
     await saveMessage(chatId, 'assistant', reply);
-    ctx.reply(reply || "I didn't get a text response back, try rephrasing.");
+    await ctx.reply(reply || "I didn't get a text response back, try rephrasing.");
   } catch (err) {
-    console.error('Error:', err);
-    ctx.reply('Something went wrong. Check the logs.');
+    console.error('Text handler error:', err);
+    try {
+      await ctx.reply('Something went wrong on my end — try again in a moment.');
+    } catch (replyErr) {
+      console.error('Could not even send the error message:', replyErr);
+    }
   }
 });
 
-// Handle uploaded documents (.docx summarization)
 bot.on('document', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const fileName = ctx.message.document.file_name || '';
@@ -176,11 +179,28 @@ bot.on('document', async (ctx) => {
     await saveMessage(chatId, 'user', `[Uploaded document: ${fileName}]`);
     await saveMessage(chatId, 'assistant', summary);
 
-    ctx.reply(summary);
+    await ctx.reply(summary);
   } catch (err) {
     console.error('Document processing error:', err);
-    ctx.reply('Something went wrong reading that document. Make sure it is a valid .docx file.');
+    try {
+      await ctx.reply('Something went wrong reading that document. Make sure it is a valid .docx file.');
+    } catch (replyErr) {
+      console.error('Could not even send the error message:', replyErr);
+    }
   }
+});
+
+// Catch-all: log any error Telegraf itself surfaces, without crashing
+bot.catch((err, ctx) => {
+  console.error(`Unhandled bot error for update ${ctx.updateType}:`, err);
+});
+
+// Safety nets: log fatal-looking errors instead of letting Node exit
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
 });
 
 setupDatabase().then(() => {
