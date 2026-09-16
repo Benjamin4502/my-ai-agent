@@ -90,6 +90,8 @@ bot.start((ctx) => ctx.reply(
   "  e.g. /signal SOL\n" +
   "- Turn on watchlist alerts: /alertson (off: /alertsoff)\n" +
   "- See the watchlist: /watchlist\n" +
+  "- Backtest a strategy: /backtest <symbol> [days]\n" +
+  "  e.g. /backtest SOL 90\n" +
   "Ask me anything else too."
 ));
 
@@ -265,6 +267,116 @@ bot.command('signal', async (ctx) => {
   } catch (err) {
     console.error('Signal calculation error:', err);
     ctx.reply('Something went wrong calculating that signal. Try again shortly.');
+  }
+});
+
+// Same math as calculateRSI, but returns the RSI value at EVERY point in time
+// (needed for backtesting, since we need to know RSI on each historical day)
+function calculateRSISeries(closes, period = 14) {
+  const series = new Array(closes.length).fill(null);
+  if (closes.length < period + 1) return series;
+
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  series[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    series[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+  return series;
+}
+
+// /backtest <symbol> [days] - simulate "buy at oversold, sell at overbought" historically
+bot.command('backtest', async (ctx) => {
+  const parts = ctx.message.text.split(' ').slice(1);
+  const symbol = (parts[0] || '').toUpperCase();
+  const days = Math.min(parseInt(parts[1], 10) || 90, 365);
+
+  if (!symbol) {
+    return ctx.reply('Usage: /backtest <symbol> [days]\nExample: /backtest SOL 90');
+  }
+
+  const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
+
+  try {
+    await ctx.reply(`Backtesting ${base} over the last ${days} days...`);
+
+    const coinId = await resolveCoinGeckoId(base);
+    if (!coinId) {
+      return ctx.reply(`Couldn't find data for "${symbol}".`);
+    }
+
+    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}&interval=daily`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (!data.prices || data.prices.length < 20) {
+      return ctx.reply(`Not enough price history for "${symbol}" over ${days} days.`);
+    }
+
+    const closes = data.prices.map((p) => p[1]);
+    const rsiSeries = calculateRSISeries(closes, 14);
+
+    let position = null; // { entryPrice }
+    const trades = [];
+
+    for (let i = 1; i < closes.length; i++) {
+      const rsi = rsiSeries[i];
+      const prevRsi = rsiSeries[i - 1];
+      if (rsi === null || prevRsi === null) continue;
+
+      // Enter: RSI crosses down into oversold (<=30) while flat
+      if (!position && prevRsi > 30 && rsi <= 30) {
+        position = { entryPrice: closes[i], entryIndex: i };
+      }
+      // Exit: RSI crosses up into overbought (>=70) while holding
+      else if (position && prevRsi < 70 && rsi >= 70) {
+        const exitPrice = closes[i];
+        const returnPct = ((exitPrice - position.entryPrice) / position.entryPrice) * 100;
+        trades.push(returnPct);
+        position = null;
+      }
+    }
+
+    let openNote = '';
+    if (position) {
+      const unrealizedPct = ((closes[closes.length - 1] - position.entryPrice) / position.entryPrice) * 100;
+      openNote = `\n(Still holding an open position from this strategy: ${unrealizedPct >= 0 ? '+' : ''}${unrealizedPct.toFixed(2)}% unrealized)`;
+    }
+
+    if (trades.length === 0) {
+      return ctx.reply(`No completed buy/sell cycles for ${base} in the last ${days} days using this RSI strategy.${openNote}\n\n⚠️ Not financial advice — a backtest on limited history doesn't guarantee future results.`);
+    }
+
+    const wins = trades.filter((t) => t > 0).length;
+    const winRate = ((wins / trades.length) * 100).toFixed(1);
+    const totalReturn = trades.reduce((sum, t) => sum + t, 0);
+    const avgReturn = (totalReturn / trades.length).toFixed(2);
+
+    ctx.reply(
+      `📊 Backtest: ${base} — RSI(14) oversold/overbought strategy, last ${days} days\n\n` +
+      `Completed trades: ${trades.length}\n` +
+      `Win rate: ${winRate}% (${wins}/${trades.length})\n` +
+      `Total return (summed): ${totalReturn >= 0 ? '+' : ''}${totalReturn.toFixed(2)}%\n` +
+      `Average return per trade: ${avgReturn >= 0 ? '+' : ''}${avgReturn}%` +
+      openNote +
+      `\n\n⚠️ This is a simplified backtest (no fees/slippage included) on limited history — not financial advice, and past results don't guarantee future ones.`
+    );
+  } catch (err) {
+    console.error('Backtest error:', err);
+    ctx.reply('Something went wrong running that backtest. Try again shortly.');
   }
 });
 
