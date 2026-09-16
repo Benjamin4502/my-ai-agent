@@ -73,6 +73,8 @@ bot.start((ctx) => ctx.reply(
   "- List reminders: /reminders\n" +
   "- Check crypto prices: /price <symbol>\n" +
   "  e.g. /price SOLUSDT\n" +
+  "- Get a basic technical signal: /signal <symbol>\n" +
+  "  e.g. /signal SOL\n" +
   "Ask me anything else too."
 ));
 
@@ -172,6 +174,82 @@ bot.command('price', async (ctx) => {
   } catch (err) {
     console.error('CoinGecko price fetch error:', err);
     ctx.reply('Something went wrong fetching that price. Try again shortly.');
+  }
+});
+
+// Calculates RSI (Relative Strength Index) from an array of closing prices.
+// Standard 14-period RSI: measures average gains vs average losses.
+function calculateRSI(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+function interpretRSI(rsi) {
+  if (rsi === null) return 'Not enough data to calculate RSI yet.';
+  if (rsi >= 70) return `RSI ${rsi.toFixed(1)} — Overbought zone. Often a caution sign, price may be due to cool off.`;
+  if (rsi <= 30) return `RSI ${rsi.toFixed(1)} — Oversold zone. Sometimes seen as a potential buy zone, but confirm with other signals.`;
+  return `RSI ${rsi.toFixed(1)} — Neutral zone. No strong overbought/oversold signal right now.`;
+}
+
+// /signal <symbol> - basic technical read using RSI(14) on daily closes
+bot.command('signal', async (ctx) => {
+  const parts = ctx.message.text.split(' ').slice(1);
+  const symbol = (parts[0] || '').toUpperCase();
+
+  if (!symbol) {
+    return ctx.reply('Usage: /signal <symbol>\nExample: /signal SOL or /signal BTC');
+  }
+
+  const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
+
+  try {
+    const coinId = await resolveCoinGeckoId(base);
+    if (!coinId) {
+      return ctx.reply(`Couldn't find data for "${symbol}". Try just the coin symbol, e.g. /signal SOL`);
+    }
+
+    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=30&interval=daily`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (!data.prices || data.prices.length < 15) {
+      return ctx.reply(`Not enough price history for "${symbol}" to calculate a signal yet.`);
+    }
+
+    const closes = data.prices.map((p) => p[1]);
+    const currentPrice = closes[closes.length - 1];
+    const rsi = calculateRSI(closes, 14);
+
+    ctx.reply(
+      `📊 Signal for ${base}\n\n` +
+      `Current price: $${currentPrice.toLocaleString()}\n` +
+      `${interpretRSI(rsi)}\n\n` +
+      `⚠️ This is a basic technical read, not financial advice. Always confirm with your own research before acting.`
+    );
+  } catch (err) {
+    console.error('Signal calculation error:', err);
+    ctx.reply('Something went wrong calculating that signal. Try again shortly.');
   }
 });
 
