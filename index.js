@@ -1,4 +1,6 @@
-// Stage 10 fix: added crash protection so one error doesn't kill the whole bot
+// Stage 11: Adds Bybit price checks — /price <symbol>
+// (all slash commands are registered before the general text handler,
+// so they get matched correctly instead of falling through to Claude)
 
 const { Telegraf } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -74,6 +76,8 @@ bot.start((ctx) => ctx.reply(
   "Ask me anything else too."
 ));
 
+// ---- All slash commands go here, BEFORE the general text handler ----
+
 bot.command('remind', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const parts = ctx.message.text.split(' ').slice(1);
@@ -111,6 +115,43 @@ bot.command('reminders', async (ctx) => {
   ctx.reply(`Your pending reminders:\n${list}`);
 });
 
+// /price <symbol> - fetch live price from Bybit public API (no API key needed)
+bot.command('price', async (ctx) => {
+  const parts = ctx.message.text.split(' ').slice(1);
+  const symbol = (parts[0] || '').toUpperCase();
+
+  if (!symbol) {
+    return ctx.reply('Usage: /price <symbol>\nExample: /price SOLUSDT');
+  }
+
+  try {
+    const url = `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.retCode !== 0 || !data.result?.list?.length) {
+      return ctx.reply(`Couldn't find data for "${symbol}". Check the symbol is correct, e.g. SOLUSDT, BTCUSDT.`);
+    }
+
+    const ticker = data.result.list[0];
+    const changePct = (parseFloat(ticker.price24hPcnt) * 100).toFixed(2);
+    const direction = changePct >= 0 ? '📈' : '📉';
+
+    ctx.reply(
+      `${symbol} — $${ticker.lastPrice}\n` +
+      `${direction} 24h change: ${changePct}%\n` +
+      `24h high: $${ticker.highPrice24h}\n` +
+      `24h low: $${ticker.lowPrice24h}\n` +
+      `24h volume: ${ticker.volume24h}`
+    );
+  } catch (err) {
+    console.error('Bybit price fetch error:', err);
+    ctx.reply('Something went wrong fetching that price. Try again shortly.');
+  }
+});
+
+// ---- Reminder background checker ----
+
 async function checkReminders() {
   try {
     const due = await pool.query(
@@ -129,6 +170,8 @@ async function checkReminders() {
   }
 }
 setInterval(checkReminders, 30 * 1000);
+
+// ---- General text handler (must come AFTER all commands above) ----
 
 bot.on('text', async (ctx) => {
   const chatId = String(ctx.chat.id);
@@ -192,47 +235,11 @@ bot.on('document', async (ctx) => {
   }
 });
 
-// /price <symbol> - fetch live price from Bybit public API (no API key needed)
-bot.command('price', async (ctx) => {
-  const parts = ctx.message.text.split(' ').slice(1);
-  const symbol = (parts[0] || '').toUpperCase();
-
-  if (!symbol) {
-    return ctx.reply('Usage: /price <symbol>\nExample: /price SOLUSDT');
-  }
-
-  try {
-    const url = `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`;
-    const response = await fetch(url);
-    const data = await response.json();
-
-    if (data.retCode !== 0 || !data.result?.list?.length) {
-      return ctx.reply(`Couldn't find data for "${symbol}". Check the symbol is correct, e.g. SOLUSDT, BTCUSDT.`);
-    }
-
-    const ticker = data.result.list[0];
-    const changePct = (parseFloat(ticker.price24hPcnt) * 100).toFixed(2);
-    const direction = changePct >= 0 ? '📈' : '📉';
-
-    ctx.reply(
-      `${symbol} — $${ticker.lastPrice}\n` +
-      `${direction} 24h change: ${changePct}%\n` +
-      `24h high: $${ticker.highPrice24h}\n` +
-      `24h low: $${ticker.lowPrice24h}\n` +
-      `24h volume: ${ticker.volume24h}`
-    );
-  } catch (err) {
-    console.error('Bybit price fetch error:', err);
-    ctx.reply('Something went wrong fetching that price. Try again shortly.');
-  }
-});
-
 // Catch-all: log any error Telegraf itself surfaces, without crashing
 bot.catch((err, ctx) => {
   console.error(`Unhandled bot error for update ${ctx.updateType}:`, err);
 });
 
-// Safety nets: log fatal-looking errors instead of letting Node exit
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled promise rejection:', reason);
 });
@@ -242,7 +249,7 @@ process.on('uncaughtException', (err) => {
 
 setupDatabase().then(() => {
   bot.launch();
-  console.log('Bot is running with Anthropic API, database, document summarization, and reminders...');
+  console.log('Bot is running with Anthropic API, database, document summarization, reminders, and crypto prices...');
 });
 
 const PORT = process.env.PORT || 3000;
