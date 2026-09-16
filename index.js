@@ -7,6 +7,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const http = require('http');
 const { Pool } = require('pg');
 const mammoth = require('mammoth');
+const crypto = require('crypto');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -92,6 +93,7 @@ bot.start((ctx) => ctx.reply(
   "- See the watchlist: /watchlist\n" +
   "- Backtest a leveraged strategy: /backtest <symbol> [days] [target%]\n" +
   "  e.g. /backtest SOL 90 100 (10x leverage, 100% profit target)\n" +
+  "- Test Bybit connection: /bybitcheck\n" +
   "Ask me anything else too."
 ));
 
@@ -406,6 +408,86 @@ bot.command('backtest', async (ctx) => {
 
 // ---- Automatic watchlist alerts (Stage 13) ----
 
+// ---- Bybit authenticated API (Stage 15) ----
+
+const BYBIT_BASE_URL = 'https://api.bybit.com';
+
+// Signs and sends a GET request to Bybit's private (authenticated) API.
+// This is read-only usage here — just checking account balance, no orders placed.
+async function bybitSignedGet(path, params = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  const timestamp = Date.now().toString();
+  const recvWindow = '5000';
+
+  const queryString = Object.keys(params)
+    .sort()
+    .map((key) => `${key}=${params[key]}`)
+    .join('&');
+
+  const signPayload = timestamp + apiKey + recvWindow + queryString;
+  const signature = crypto.createHmac('sha256', apiSecret).update(signPayload).digest('hex');
+
+  const url = `${BYBIT_BASE_URL}${path}${queryString ? '?' + queryString : ''}`;
+  const response = await fetch(url, {
+    headers: {
+      'X-BAPI-API-KEY': apiKey,
+      'X-BAPI-TIMESTAMP': timestamp,
+      'X-BAPI-RECV-WINDOW': recvWindow,
+      'X-BAPI-SIGN': signature,
+    },
+  });
+
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Not valid JSON — likely a block page or HTML error, same pattern as the earlier public-API issue
+    throw new Error(`Bybit returned non-JSON response (first 200 chars): ${text.slice(0, 200)}`);
+  }
+}
+
+// /bybitcheck - read-only connectivity + balance test, no trading
+bot.command('bybitcheck', async (ctx) => {
+  if (!process.env.BYBIT_API_KEY || !process.env.BYBIT_API_SECRET) {
+    return ctx.reply('Bybit API keys are not set up yet on the server.');
+  }
+
+  try {
+    await ctx.reply('Checking connection to Bybit...');
+    const data = await bybitSignedGet('/v5/account/wallet-balance', { accountType: 'UNIFIED' });
+
+    if (data.retCode !== 0) {
+      return ctx.reply(
+        `Bybit responded, but with an error:\n` +
+        `Code: ${data.retCode}\n` +
+        `Message: ${data.retMsg}\n\n` +
+        `This usually means a permissions or key issue, not a region block (since we got a real response back).`
+      );
+    }
+
+    const account = data.result?.list?.[0];
+    if (!account) {
+      return ctx.reply('Connected successfully, but no account data returned. Check your account has a Unified Trading balance.');
+    }
+
+    const totalEquity = parseFloat(account.totalEquity || 0).toFixed(2);
+    ctx.reply(
+      `✅ Bybit connection successful!\n\n` +
+      `Account type: Unified Trading\n` +
+      `Total equity: $${totalEquity}\n\n` +
+      `This confirms Render's server CAN reach Bybit's authenticated API — the earlier region block only affected the public market-data endpoint, not this one.`
+    );
+  } catch (err) {
+    console.error('Bybit connectivity check error:', err);
+    ctx.reply(
+      `❌ Connection to Bybit failed.\n\n` +
+      `Error: ${err.message}\n\n` +
+      `This could mean Render's region is blocked for Bybit's private API too — we'll need to look at redeploying to a different region if so.`
+    );
+  }
+});
+
 const WATCHLIST = [
   // Original
   'SOL', 'NOM', 'MYX',
@@ -605,4 +687,3 @@ http.createServer((req, res) => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
