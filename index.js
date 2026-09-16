@@ -35,6 +35,19 @@ async function setupDatabase() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_subscribers (
+      chat_id TEXT PRIMARY KEY,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_state (
+      symbol TEXT PRIMARY KEY,
+      zone TEXT NOT NULL DEFAULT 'neutral',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
   console.log('Database ready.');
 }
 
@@ -75,6 +88,8 @@ bot.start((ctx) => ctx.reply(
   "  e.g. /price SOLUSDT\n" +
   "- Get a basic technical signal: /signal <symbol>\n" +
   "  e.g. /signal SOL\n" +
+  "- Turn on watchlist alerts: /alertson (off: /alertsoff)\n" +
+  "- See the watchlist: /watchlist\n" +
   "Ask me anything else too."
 ));
 
@@ -252,6 +267,90 @@ bot.command('signal', async (ctx) => {
     ctx.reply('Something went wrong calculating that signal. Try again shortly.');
   }
 });
+
+// ---- Automatic watchlist alerts (Stage 13) ----
+
+const WATCHLIST = ['SOL', 'NOM', 'MYX'];
+
+bot.command('alertson', async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  await pool.query(
+    'INSERT INTO alert_subscribers (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING',
+    [chatId]
+  );
+  ctx.reply(`Alerts turned on ✅\nWatching: ${WATCHLIST.join(', ')}\nYou'll get a message when any of these enter overbought or oversold territory.`);
+});
+
+bot.command('alertsoff', async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  await pool.query('DELETE FROM alert_subscribers WHERE chat_id = $1', [chatId]);
+  ctx.reply('Alerts turned off. You can turn them back on anytime with /alertson.');
+});
+
+bot.command('watchlist', async (ctx) => {
+  ctx.reply(`Current auto-watchlist: ${WATCHLIST.join(', ')}`);
+});
+
+function zoneForRSI(rsi) {
+  if (rsi === null) return 'neutral';
+  if (rsi >= 70) return 'overbought';
+  if (rsi <= 30) return 'oversold';
+  return 'neutral';
+}
+
+async function checkWatchlistAlerts() {
+  try {
+    const subs = await pool.query('SELECT chat_id FROM alert_subscribers');
+    if (subs.rows.length === 0) return; // nobody subscribed, skip the work
+
+    for (const base of WATCHLIST) {
+      try {
+        const coinId = await resolveCoinGeckoId(base);
+        if (!coinId) continue;
+
+        const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=30&interval=daily`;
+        const response = await fetch(url);
+        const data = await response.json();
+        if (!data.prices || data.prices.length < 15) continue;
+
+        const closes = data.prices.map((p) => p[1]);
+        const currentPrice = closes[closes.length - 1];
+        const rsi = calculateRSI(closes, 14);
+        const newZone = zoneForRSI(rsi);
+
+        const stateResult = await pool.query('SELECT zone FROM alert_state WHERE symbol = $1', [base]);
+        const oldZone = stateResult.rows[0]?.zone ?? 'neutral';
+
+        // Only alert when actually crossing INTO overbought/oversold, not every check
+        if (newZone !== oldZone && (newZone === 'overbought' || newZone === 'oversold')) {
+          const message =
+            `🔔 Watchlist alert: ${base}\n` +
+            `Price: $${currentPrice.toLocaleString()}\n` +
+            `${interpretRSI(rsi)}`;
+
+          for (const sub of subs.rows) {
+            try {
+              await bot.telegram.sendMessage(sub.chat_id, message);
+            } catch (sendErr) {
+              console.error(`Failed to send alert to ${sub.chat_id}:`, sendErr);
+            }
+          }
+        }
+
+        await pool.query(
+          `INSERT INTO alert_state (symbol, zone, updated_at) VALUES ($1, $2, NOW())
+           ON CONFLICT (symbol) DO UPDATE SET zone = $2, updated_at = NOW()`,
+          [base, newZone]
+        );
+      } catch (coinErr) {
+        console.error(`Watchlist check failed for ${base}:`, coinErr);
+      }
+    }
+  } catch (err) {
+    console.error('Watchlist alert check error:', err);
+  }
+}
+setInterval(checkWatchlistAlerts, 30 * 60 * 1000); // every 30 minutes
 
 // ---- Reminder background checker ----
 
