@@ -69,6 +69,8 @@ bot.start((ctx) => ctx.reply(
   "- Set reminders: /remind <minutes> <message>\n" +
   "  e.g. /remind 30 Call the printing vendor\n" +
   "- List reminders: /reminders\n" +
+  "- Check crypto prices: /price <symbol>\n" +
+  "  e.g. /price SOLUSDT\n" +
   "Ask me anything else too."
 ));
 
@@ -187,6 +189,41 @@ bot.on('document', async (ctx) => {
     } catch (replyErr) {
       console.error('Could not even send the error message:', replyErr);
     }
+  }
+});
+
+// /price <symbol> - fetch live price from Bybit public API (no API key needed)
+bot.command('price', async (ctx) => {
+  const parts = ctx.message.text.split(' ').slice(1);
+  const symbol = (parts[0] || '').toUpperCase();
+
+  if (!symbol) {
+    return ctx.reply('Usage: /price <symbol>\nExample: /price SOLUSDT');
+  }
+
+  try {
+    const url = `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`;
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.retCode !== 0 || !data.result?.list?.length) {
+      return ctx.reply(`Couldn't find data for "${symbol}". Check the symbol is correct, e.g. SOLUSDT, BTCUSDT.`);
+    }
+
+    const ticker = data.result.list[0];
+    const changePct = (parseFloat(ticker.price24hPcnt) * 100).toFixed(2);
+    const direction = changePct >= 0 ? '📈' : '📉';
+
+    ctx.reply(
+      `${symbol} — $${ticker.lastPrice}\n` +
+      `${direction} 24h change: ${changePct}%\n` +
+      `24h high: $${ticker.highPrice24h}\n` +
+      `24h low: $${ticker.lowPrice24h}\n` +
+      `24h volume: ${ticker.volume24h}`
+    );
+  } catch (err) {
+    console.error('Bybit price fetch error:', err);
+    ctx.reply('Something went wrong fetching that price. Try again shortly.');
   }
 });
 
