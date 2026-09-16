@@ -116,36 +116,61 @@ bot.command('reminders', async (ctx) => {
 });
 
 // /price <symbol> - fetch live price from Bybit public API (no API key needed)
+// A small lookup for common tickers -> CoinGecko IDs
+const COINGECKO_IDS = {
+  BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', BNB: 'binancecoin',
+  XRP: 'ripple', DOGE: 'dogecoin', ADA: 'cardano', TON: 'the-open-network',
+  TRX: 'tron', LINK: 'chainlink', AVAX: 'avalanche-2', MATIC: 'matic-network',
+  DOT: 'polkadot', LTC: 'litecoin', SHIB: 'shiba-inu', NOM: 'onomy-protocol',
+  MYX: 'myx-finance',
+};
+
+async function resolveCoinGeckoId(base) {
+  if (COINGECKO_IDS[base]) return COINGECKO_IDS[base];
+  // Fallback: search CoinGecko directly for anything not in our shortlist
+  const searchRes = await fetch(`https://api.coingecko.com/api/v3/search?query=${base}`);
+  const searchData = await searchRes.json();
+  const match = searchData.coins?.find((c) => c.symbol.toUpperCase() === base);
+  return match ? match.id : null;
+}
+
+// /price <symbol> - fetch live price from CoinGecko's public API (no key, no region blocks)
 bot.command('price', async (ctx) => {
   const parts = ctx.message.text.split(' ').slice(1);
-  const symbol = (parts[0] || '').toUpperCase();
+  let symbol = (parts[0] || '').toUpperCase();
 
   if (!symbol) {
-    return ctx.reply('Usage: /price <symbol>\nExample: /price SOLUSDT');
+    return ctx.reply('Usage: /price <symbol>\nExample: /price SOL or /price SOLUSDT');
   }
 
-  try {
-    const url = `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`;
-    const response = await fetch(url);
-    const data = await response.json();
+  const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
 
-    if (data.retCode !== 0 || !data.result?.list?.length) {
-      return ctx.reply(`Couldn't find data for "${symbol}". Check the symbol is correct, e.g. SOLUSDT, BTCUSDT.`);
+  try {
+    const coinId = await resolveCoinGeckoId(base);
+    if (!coinId) {
+      return ctx.reply(`Couldn't find data for "${symbol}". Try just the coin symbol, e.g. /price SOL`);
     }
 
-    const ticker = data.result.list[0];
-    const changePct = (parseFloat(ticker.price24hPcnt) * 100).toFixed(2);
-    const direction = changePct >= 0 ? '📈' : '📉';
+    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true`;
+    const response = await fetch(url);
+    const data = await response.json();
+    const info = data[coinId];
+
+    if (!info) {
+      return ctx.reply(`Couldn't find price data for "${symbol}" right now.`);
+    }
+
+    const changePct = info.usd_24h_change?.toFixed(2) ?? 'N/A';
+    const direction = (info.usd_24h_change ?? 0) >= 0 ? '📈' : '📉';
 
     ctx.reply(
-      `${symbol} — $${ticker.lastPrice}\n` +
+      `${base} — $${info.usd.toLocaleString()}\n` +
       `${direction} 24h change: ${changePct}%\n` +
-      `24h high: $${ticker.highPrice24h}\n` +
-      `24h low: $${ticker.lowPrice24h}\n` +
-      `24h volume: ${ticker.volume24h}`
+      `24h volume: $${Math.round(info.usd_24h_vol).toLocaleString()}\n` +
+      `Market cap: $${Math.round(info.usd_market_cap).toLocaleString()}`
     );
   } catch (err) {
-    console.error('Bybit price fetch error:', err);
+    console.error('CoinGecko price fetch error:', err);
     ctx.reply('Something went wrong fetching that price. Try again shortly.');
   }
 });
