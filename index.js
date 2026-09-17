@@ -55,10 +55,15 @@ async function setupDatabase() {
       chat_id TEXT NOT NULL,
       symbol TEXT NOT NULL,
       target_pct INTEGER NOT NULL,
+      stop_loss_pct INTEGER NOT NULL DEFAULT 50,
       leverage INTEGER NOT NULL DEFAULT 10,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TIMESTAMP DEFAULT NOW()
     );
+  `);
+  // In case the table already existed from before this column was added
+  await pool.query(`
+    ALTER TABLE trade_suggestions ADD COLUMN IF NOT EXISTS stop_loss_pct INTEGER NOT NULL DEFAULT 50;
   `);
   console.log('Database ready.');
 }
@@ -105,8 +110,8 @@ bot.start((ctx) => ctx.reply(
   "- Backtest a leveraged strategy: /backtest <symbol> [days] [target%]\n" +
   "  e.g. /backtest SOL 90 100 (10x leverage, 100% profit target)\n" +
   "- Test Bybit connection: /bybitcheck\n" +
-  "- Get a trade suggestion (confirm before anything is placed): /suggest <symbol> [target%]\n" +
-  "  e.g. /suggest SOL 100\n" +
+  "- Get a trade suggestion (confirm before anything is placed): /suggest <symbol> [target%] [stoploss%]\n" +
+  "  e.g. /suggest SOL 100 50 (100% take-profit, stop-loss at 50% of margin)\n" +
   "Ask me anything else too."
 ));
 
@@ -539,15 +544,17 @@ function roundToStep(value, step) {
   return rounded.toFixed(precision);
 }
 
-// /suggest <symbol> [target%] - proposes a leveraged long trade, waits for explicit confirmation
+// /suggest <symbol> [target%] [stoploss%] - proposes a leveraged long trade, waits for explicit confirmation
 bot.command('suggest', async (ctx) => {
   const parts = ctx.message.text.split(' ').slice(1);
   const symbol = (parts[0] || '').toUpperCase();
   const targetPct = [50, 100, 150, 200].includes(parseInt(parts[1], 10)) ? parseInt(parts[1], 10) : 100;
+  // Stop-loss as a % of MARGIN you're willing to lose (not price %). Default 50% of margin.
+  const stopLossPct = parseInt(parts[2], 10) > 0 && parseInt(parts[2], 10) < 100 ? parseInt(parts[2], 10) : 50;
   const leverage = 10;
 
   if (!symbol) {
-    return ctx.reply('Usage: /suggest <symbol> [target%]\nExample: /suggest SOL 100');
+    return ctx.reply('Usage: /suggest <symbol> [target%] [stoploss%]\nExample: /suggest SOL 100 50\n(stoploss% is % of margin you\'re willing to risk, default 50, must be under 100)');
   }
 
   const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
@@ -571,10 +578,11 @@ bot.command('suggest', async (ctx) => {
 
     const targetPrice = currentPrice * (1 + targetPct / leverage / 100);
     const liquidationPrice = currentPrice * (1 - 1 / leverage);
+    const stopLossPrice = currentPrice * (1 - stopLossPct / leverage / 100);
 
     const suggestion = await pool.query(
-      `INSERT INTO trade_suggestions (chat_id, symbol, target_pct, leverage) VALUES ($1, $2, $3, $4) RETURNING id`,
-      [String(ctx.chat.id), bybitSymbol, targetPct, leverage]
+      `INSERT INTO trade_suggestions (chat_id, symbol, target_pct, stop_loss_pct, leverage) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [String(ctx.chat.id), bybitSymbol, targetPct, stopLossPct, leverage]
     );
     const suggestionId = suggestion.rows[0].id;
 
@@ -584,8 +592,9 @@ bot.command('suggest', async (ctx) => {
       `Entry (approx): $${currentPrice.toLocaleString()}\n` +
       `Leverage: ${leverage}x\n` +
       `Margin: 10% of account equity\n` +
-      `Take-profit target: ${targetPct}% → approx $${targetPrice.toLocaleString()}\n` +
-      `Liquidation risk if price drops to approx $${liquidationPrice.toLocaleString()} (-${(100 / leverage).toFixed(0)}% move)\n\n` +
+      `Take-profit: ${targetPct}% → approx $${targetPrice.toLocaleString()}\n` +
+      `Stop-loss: -${stopLossPct}% of margin → approx $${stopLossPrice.toLocaleString()}\n` +
+      `(Full liquidation would happen around $${liquidationPrice.toLocaleString()} — the stop-loss is set to close you out well before that)\n\n` +
       `⚠️ This is not financial advice. Nothing happens until you confirm below.`,
       Markup.inlineKeyboard([
         Markup.button.callback('✅ Confirm trade', `confirm_${suggestionId}`),
@@ -620,7 +629,7 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
     await ctx.editMessageReplyMarkup(null);
     await ctx.reply('Placing order on Bybit...');
 
-    const { symbol, target_pct: targetPct, leverage } = suggestion;
+    const { symbol, target_pct: targetPct, stop_loss_pct: stopLossPct, leverage } = suggestion;
 
     // 1. Get current account equity
     const balanceData = await bybitSignedGet('/v5/account/wallet-balance', { accountType: 'UNIFIED' });
@@ -656,8 +665,10 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
       category: 'linear', symbol, buyLeverage: String(leverage), sellLeverage: String(leverage),
     });
 
-    // 4. Place the market order with a take-profit attached
-    const takeProfitPrice = (currentPrice * (1 + targetPct / leverage / 100)).toFixed(instrument.priceFilter?.tickSize?.includes('.') ? instrument.priceFilter.tickSize.split('.')[1].length : 2);
+    // 4. Place the market order with BOTH take-profit and stop-loss attached
+    const pricePrecision = instrument.priceFilter?.tickSize?.includes('.') ? instrument.priceFilter.tickSize.split('.')[1].length : 2;
+    const takeProfitPrice = (currentPrice * (1 + targetPct / leverage / 100)).toFixed(pricePrecision);
+    const stopLossPrice = (currentPrice * (1 - stopLossPct / leverage / 100)).toFixed(pricePrecision);
 
     const orderResult = await bybitSignedPost('/v5/order/create', {
       category: 'linear',
@@ -666,6 +677,7 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
       orderType: 'Market',
       qty: String(qty),
       takeProfit: String(takeProfitPrice),
+      stopLoss: String(stopLossPrice),
       timeInForce: 'GoodTillCancel',
     });
 
@@ -680,7 +692,8 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
       `${symbol} LONG — ${leverage}x\n` +
       `Qty: ${qty}\n` +
       `Margin used: ~$${marginUsd.toFixed(2)}\n` +
-      `Take-profit set at: $${takeProfitPrice}\n\n` +
+      `Take-profit set at: $${takeProfitPrice}\n` +
+      `Stop-loss set at: $${stopLossPrice}\n\n` +
       `Monitor this on the Bybit app directly for real-time position status.`
     );
   } catch (err) {
@@ -695,7 +708,7 @@ const WATCHLIST = [
   // AI narrative
   'FET', 'RNDR', 'TAO', 'AGIX', 'WLD', 'ARKM', 'AKT', 'GRT', 'OCEAN',
   // Requested pairs
-  'JCT', 'LTC', 'MUBARAK', 'XPIN', 'ZEC', 'CLCLX', 'SIREN', 'SKR',
+  'JCT', 'LTC', 'MUBARAK', 'XPIN', 'ZEC', 'CLCLX', 'SIREN', 'SKR', 'PENGU', 
 ];
 
 bot.command('alertson', async (ctx) => {
