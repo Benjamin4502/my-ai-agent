@@ -561,7 +561,8 @@ bot.command('suggest', async (ctx) => {
     const response = await fetch(url);
     const data = await response.json();
     if (!data.prices || data.prices.length < 15) {
-      return ctx.reply(`Not enough price history for "${symbol}" yet.`);
+      console.error(`CoinGecko response issue for ${symbol} (HTTP ${response.status}):`, JSON.stringify(data).slice(0, 300));
+      return ctx.reply(`Not enough price history for "${symbol}" yet. (HTTP ${response.status} - check Render logs)`);
     }
 
     const closes = data.prices.map((p) => p[1]);
