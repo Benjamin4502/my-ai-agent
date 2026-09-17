@@ -172,10 +172,20 @@ const COINGECKO_IDS = {
   // added here only if a confirmed exact CoinGecko ID is known
 };
 
+// All CoinGecko calls go through this so the API key (if set) is always attached —
+// this puts our requests in our own rate-limit pool instead of the shared/anonymous one.
+function fetchCoinGecko(url) {
+  const headers = {};
+  if (process.env.COINGECKO_API_KEY) {
+    headers['x-cg-demo-api-key'] = process.env.COINGECKO_API_KEY;
+  }
+  return fetch(url, { headers });
+}
+
 async function resolveCoinGeckoId(base) {
   if (COINGECKO_IDS[base]) return COINGECKO_IDS[base];
   // Fallback: search CoinGecko directly for anything not in our shortlist
-  const searchRes = await fetch(`https://api.coingecko.com/api/v3/search?query=${base}`);
+  const searchRes = await fetchCoinGecko(`https://api.coingecko.com/api/v3/search?query=${base}`);
   const searchData = await searchRes.json();
   const match = searchData.coins?.find((c) => c.symbol.toUpperCase() === base);
   return match ? match.id : null;
@@ -198,7 +208,7 @@ async function getMarketChart(coinId, days) {
   const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}&interval=daily`;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const response = await fetch(url);
+    const response = await fetchCoinGecko(url);
     if (response.status === 429 && attempt === 1) {
       await new Promise((resolve) => setTimeout(resolve, 2000)); // brief backoff, then retry once
       continue;
@@ -233,7 +243,7 @@ bot.command('price', async (ctx) => {
     }
 
     const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true`;
-    const response = await fetch(url);
+    const response = await fetchCoinGecko(url);
     const data = await response.json();
     const info = data[coinId];
 
@@ -926,4 +936,3 @@ http.createServer((req, res) => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
