@@ -181,6 +181,40 @@ async function resolveCoinGeckoId(base) {
   return match ? match.id : null;
 }
 
+// Shared, cached fetcher for daily price history — every command that needs
+// price history goes through here instead of calling CoinGecko directly.
+// This drastically cuts the number of outbound calls (fixing rate-limit issues)
+// and retries once automatically if CoinGecko returns a 429.
+const marketChartCache = new Map(); // key: "coinId:days" -> { data, fetchedAt }
+const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+
+async function getMarketChart(coinId, days) {
+  const cacheKey = `${coinId}:${days}`;
+  const cached = marketChartCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}&interval=daily`;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const response = await fetch(url);
+    if (response.status === 429 && attempt === 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2000)); // brief backoff, then retry once
+      continue;
+    }
+    const data = await response.json();
+    if (!response.ok || !data.prices) {
+      console.error(`CoinGecko market_chart issue for ${coinId} (HTTP ${response.status}):`, JSON.stringify(data).slice(0, 300));
+      return { prices: null, httpStatus: response.status };
+    }
+    marketChartCache.set(cacheKey, { data, fetchedAt: Date.now() });
+    return data;
+  }
+
+  return { prices: null, httpStatus: 429 };
+}
+
 // /price <symbol> - fetch live price from CoinGecko's public API (no key, no region blocks)
 bot.command('price', async (ctx) => {
   const parts = ctx.message.text.split(' ').slice(1);
@@ -274,12 +308,10 @@ bot.command('signal', async (ctx) => {
       return ctx.reply(`Couldn't find data for "${symbol}". Try just the coin symbol, e.g. /signal SOL`);
     }
 
-    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=30&interval=daily`;
-    const response = await fetch(url);
-    const data = await response.json();
+    const data = await getMarketChart(coinId, 30);
 
     if (!data.prices || data.prices.length < 15) {
-      return ctx.reply(`Not enough price history for "${symbol}" to calculate a signal yet.`);
+      return ctx.reply(`Not enough price history for "${symbol}" to calculate a signal yet.${data.httpStatus === 429 ? ' (CoinGecko rate limit, try again shortly)' : ''}`);
     }
 
     const closes = data.prices.map((p) => p[1]);
@@ -348,12 +380,10 @@ bot.command('backtest', async (ctx) => {
       return ctx.reply(`Couldn't find data for "${symbol}". Small/new tokens may not be listed on CoinGecko yet.`);
     }
 
-    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}&interval=daily`;
-    const response = await fetch(url);
-    const data = await response.json();
+    const data = await getMarketChart(coinId, days);
 
     if (!data.prices || data.prices.length < 20) {
-      return ctx.reply(`Not enough price history for "${symbol}" over ${days} days.`);
+      return ctx.reply(`Not enough price history for "${symbol}" over ${days} days.${data.httpStatus === 429 ? ' (CoinGecko rate limit, try again shortly)' : ''}`);
     }
 
     const closes = data.prices.map((p) => p[1]);
@@ -564,12 +594,9 @@ bot.command('suggest', async (ctx) => {
     const coinId = await resolveCoinGeckoId(base);
     if (!coinId) return ctx.reply(`Couldn't find data for "${symbol}".`);
 
-    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=30&interval=daily`;
-    const response = await fetch(url);
-    const data = await response.json();
+    const data = await getMarketChart(coinId, 30);
     if (!data.prices || data.prices.length < 15) {
-      console.error(`CoinGecko response issue for ${symbol} (HTTP ${response.status}):`, JSON.stringify(data).slice(0, 300));
-      return ctx.reply(`Not enough price history for "${symbol}" yet. (HTTP ${response.status} - check Render logs)`);
+      return ctx.reply(`Not enough price history for "${symbol}" yet.${data.httpStatus === 429 ? ' (CoinGecko rate limit, try again shortly)' : ''}`);
     }
 
     const closes = data.prices.map((p) => p[1]);
@@ -708,7 +735,7 @@ const WATCHLIST = [
   // AI narrative
   'FET', 'RNDR', 'TAO', 'AGIX', 'WLD', 'ARKM', 'AKT', 'GRT', 'OCEAN',
   // Requested pairs
-  'JCT', 'LTC', 'MUBARAK', 'XPIN', 'ZEC', 'CLCLX', 'SIREN', 'SKR', 'PENGU', 
+  'JCT', 'LTC', 'MUBARAK', 'XPIN', 'ZEC', 'CLCLX', 'SIREN', 'SKR',
 ];
 
 bot.command('alertson', async (ctx) => {
@@ -747,9 +774,7 @@ async function checkWatchlistAlerts() {
         const coinId = await resolveCoinGeckoId(base);
         if (!coinId) continue;
 
-        const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=30&interval=daily`;
-        const response = await fetch(url);
-        const data = await response.json();
+        const data = await getMarketChart(coinId, 30);
         if (!data.prices || data.prices.length < 15) continue;
 
         const closes = data.prices.map((p) => p[1]);
@@ -901,3 +926,4 @@ http.createServer((req, res) => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
