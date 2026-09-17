@@ -2,7 +2,7 @@
 // (all slash commands are registered before the general text handler,
 // so they get matched correctly instead of falling through to Claude)
 
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
 const http = require('http');
 const { Pool } = require('pg');
@@ -47,6 +47,17 @@ async function setupDatabase() {
       symbol TEXT PRIMARY KEY,
       zone TEXT NOT NULL DEFAULT 'neutral',
       updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trade_suggestions (
+      id SERIAL PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      target_pct INTEGER NOT NULL,
+      leverage INTEGER NOT NULL DEFAULT 10,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW()
     );
   `);
   console.log('Database ready.');
@@ -94,6 +105,8 @@ bot.start((ctx) => ctx.reply(
   "- Backtest a leveraged strategy: /backtest <symbol> [days] [target%]\n" +
   "  e.g. /backtest SOL 90 100 (10x leverage, 100% profit target)\n" +
   "- Test Bybit connection: /bybitcheck\n" +
+  "- Get a trade suggestion (confirm before anything is placed): /suggest <symbol> [target%]\n" +
+  "  e.g. /suggest SOL 100\n" +
   "Ask me anything else too."
 ));
 
@@ -485,6 +498,193 @@ bot.command('bybitcheck', async (ctx) => {
       `Error: ${err.message}\n\n` +
       `This could mean Render's region is blocked for Bybit's private API too — we'll need to look at redeploying to a different region if so.`
     );
+  }
+});
+
+// Signs and sends a POST request to Bybit's private API (used for placing orders/setting leverage)
+async function bybitSignedPost(path, body = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  const timestamp = Date.now().toString();
+  const recvWindow = '5000';
+  const bodyString = JSON.stringify(body);
+
+  const signPayload = timestamp + apiKey + recvWindow + bodyString;
+  const signature = crypto.createHmac('sha256', apiSecret).update(signPayload).digest('hex');
+
+  const response = await fetch(`${BYBIT_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-BAPI-API-KEY': apiKey,
+      'X-BAPI-TIMESTAMP': timestamp,
+      'X-BAPI-RECV-WINDOW': recvWindow,
+      'X-BAPI-SIGN': signature,
+    },
+    body: bodyString,
+  });
+
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Bybit returned non-JSON response: ${text.slice(0, 200)}`);
+  }
+}
+
+// Rounds a quantity down to the symbol's allowed step size (Bybit rejects orders otherwise)
+function roundToStep(value, step) {
+  const precision = step.includes('.') ? step.split('.')[1].length : 0;
+  const rounded = Math.floor(value / parseFloat(step)) * parseFloat(step);
+  return rounded.toFixed(precision);
+}
+
+// /suggest <symbol> [target%] - proposes a leveraged long trade, waits for explicit confirmation
+bot.command('suggest', async (ctx) => {
+  const parts = ctx.message.text.split(' ').slice(1);
+  const symbol = (parts[0] || '').toUpperCase();
+  const targetPct = [50, 100, 150, 200].includes(parseInt(parts[1], 10)) ? parseInt(parts[1], 10) : 100;
+  const leverage = 10;
+
+  if (!symbol) {
+    return ctx.reply('Usage: /suggest <symbol> [target%]\nExample: /suggest SOL 100');
+  }
+
+  const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
+  const bybitSymbol = `${base}USDT`;
+
+  try {
+    const coinId = await resolveCoinGeckoId(base);
+    if (!coinId) return ctx.reply(`Couldn't find data for "${symbol}".`);
+
+    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=30&interval=daily`;
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!data.prices || data.prices.length < 15) {
+      return ctx.reply(`Not enough price history for "${symbol}" yet.`);
+    }
+
+    const closes = data.prices.map((p) => p[1]);
+    const currentPrice = closes[closes.length - 1];
+    const rsi = calculateRSI(closes, 14);
+
+    const targetPrice = currentPrice * (1 + targetPct / leverage / 100);
+    const liquidationPrice = currentPrice * (1 - 1 / leverage);
+
+    const suggestion = await pool.query(
+      `INSERT INTO trade_suggestions (chat_id, symbol, target_pct, leverage) VALUES ($1, $2, $3, $4) RETURNING id`,
+      [String(ctx.chat.id), bybitSymbol, targetPct, leverage]
+    );
+    const suggestionId = suggestion.rows[0].id;
+
+    await ctx.reply(
+      `💡 Trade suggestion: ${base} LONG\n\n` +
+      `${interpretRSI(rsi)}\n\n` +
+      `Entry (approx): $${currentPrice.toLocaleString()}\n` +
+      `Leverage: ${leverage}x\n` +
+      `Margin: 10% of account equity\n` +
+      `Take-profit target: ${targetPct}% → approx $${targetPrice.toLocaleString()}\n` +
+      `Liquidation risk if price drops to approx $${liquidationPrice.toLocaleString()} (-${(100 / leverage).toFixed(0)}% move)\n\n` +
+      `⚠️ This is not financial advice. Nothing happens until you confirm below.`,
+      Markup.inlineKeyboard([
+        Markup.button.callback('✅ Confirm trade', `confirm_${suggestionId}`),
+        Markup.button.callback('❌ Cancel', `cancel_${suggestionId}`),
+      ])
+    );
+  } catch (err) {
+    console.error('Suggest command error:', err);
+    ctx.reply('Something went wrong generating that suggestion. Try again shortly.');
+  }
+});
+
+bot.action(/^cancel_(\d+)$/, async (ctx) => {
+  const id = ctx.match[1];
+  await pool.query(`UPDATE trade_suggestions SET status = 'cancelled' WHERE id = $1`, [id]);
+  await ctx.editMessageReplyMarkup(null);
+  await ctx.reply('Trade cancelled — nothing was placed.');
+});
+
+bot.action(/^confirm_(\d+)$/, async (ctx) => {
+  const id = ctx.match[1];
+
+  try {
+    const result = await pool.query(`SELECT * FROM trade_suggestions WHERE id = $1 AND status = 'pending'`, [id]);
+    const suggestion = result.rows[0];
+
+    if (!suggestion) {
+      await ctx.answerCbQuery('This suggestion is no longer available.');
+      return;
+    }
+
+    await ctx.editMessageReplyMarkup(null);
+    await ctx.reply('Placing order on Bybit...');
+
+    const { symbol, target_pct: targetPct, leverage } = suggestion;
+
+    // 1. Get current account equity
+    const balanceData = await bybitSignedGet('/v5/account/wallet-balance', { accountType: 'UNIFIED' });
+    const equity = parseFloat(balanceData.result?.list?.[0]?.totalEquity || 0);
+    if (!equity || equity <= 0) {
+      return ctx.reply('Could not read a usable account balance. Trade not placed.');
+    }
+    const marginUsd = equity * 0.10;
+
+    // 2. Get instrument info (min qty, qty step, and current price)
+    const instrumentData = await bybitSignedGet('/v5/market/instruments-info', { category: 'linear', symbol });
+    const instrument = instrumentData.result?.list?.[0];
+    if (!instrument) {
+      return ctx.reply(`Bybit doesn't list "${symbol}" as a tradeable futures pair. Trade not placed.`);
+    }
+    const qtyStep = instrument.lotSizeFilter.qtyStep;
+    const minQty = parseFloat(instrument.lotSizeFilter.minOrderQty);
+
+    const tickerData = await bybitSignedGet('/v5/market/tickers', { category: 'linear', symbol });
+    const currentPrice = parseFloat(tickerData.result?.list?.[0]?.lastPrice);
+    if (!currentPrice) {
+      return ctx.reply('Could not fetch a current price for that symbol. Trade not placed.');
+    }
+
+    const positionValue = marginUsd * leverage;
+    let qty = roundToStep(positionValue / currentPrice, qtyStep);
+    if (parseFloat(qty) < minQty) {
+      return ctx.reply(`Position size too small for ${symbol}'s minimum order size. Trade not placed. Try a smaller leverage or larger margin.`);
+    }
+
+    // 3. Set leverage for this symbol
+    await bybitSignedPost('/v5/position/set-leverage', {
+      category: 'linear', symbol, buyLeverage: String(leverage), sellLeverage: String(leverage),
+    });
+
+    // 4. Place the market order with a take-profit attached
+    const takeProfitPrice = (currentPrice * (1 + targetPct / leverage / 100)).toFixed(instrument.priceFilter?.tickSize?.includes('.') ? instrument.priceFilter.tickSize.split('.')[1].length : 2);
+
+    const orderResult = await bybitSignedPost('/v5/order/create', {
+      category: 'linear',
+      symbol,
+      side: 'Buy',
+      orderType: 'Market',
+      qty: String(qty),
+      takeProfit: String(takeProfitPrice),
+      timeInForce: 'GoodTillCancel',
+    });
+
+    if (orderResult.retCode !== 0) {
+      await pool.query(`UPDATE trade_suggestions SET status = 'failed' WHERE id = $1`, [id]);
+      return ctx.reply(`❌ Order failed.\nCode: ${orderResult.retCode}\nMessage: ${orderResult.retMsg}`);
+    }
+
+    await pool.query(`UPDATE trade_suggestions SET status = 'executed' WHERE id = $1`, [id]);
+    ctx.reply(
+      `✅ Order placed on Bybit!\n\n` +
+      `${symbol} LONG — ${leverage}x\n` +
+      `Qty: ${qty}\n` +
+      `Margin used: ~$${marginUsd.toFixed(2)}\n` +
+      `Take-profit set at: $${takeProfitPrice}\n\n` +
+      `Monitor this on the Bybit app directly for real-time position status.`
+    );
+  } catch (err) {
+    console.error('Trade confirmation error:', err);
+    ctx.reply(`Something went wrong placing the order: ${err.message}`);
   }
 });
 
