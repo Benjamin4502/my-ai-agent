@@ -65,6 +65,9 @@ async function setupDatabase() {
   await pool.query(`
     ALTER TABLE trade_suggestions ADD COLUMN IF NOT EXISTS stop_loss_pct INTEGER NOT NULL DEFAULT 50;
   `);
+  await pool.query(`
+    ALTER TABLE trade_suggestions ADD COLUMN IF NOT EXISTS side TEXT NOT NULL DEFAULT 'Buy';
+  `);
   console.log('Database ready.');
 }
 
@@ -110,8 +113,9 @@ bot.start((ctx) => ctx.reply(
   "- Backtest a leveraged strategy: /backtest <symbol> [days] [target%]\n" +
   "  e.g. /backtest SOL 90 100 (10x leverage, 100% profit target)\n" +
   "- Test Bybit connection: /bybitcheck\n" +
-  "- Get a trade suggestion (confirm before anything is placed): /suggest <symbol> [target%] [stoploss%]\n" +
+  "- Get a trade suggestion (LONG or SHORT auto-picked by RSI, confirm before anything is placed): /suggest <symbol> [target%] [stoploss%]\n" +
   "  e.g. /suggest SOL 100 50 (100% take-profit, stop-loss at 50% of margin)\n" +
+  "- Check open positions: /positions\n" +
   "Ask me anything else too."
 ));
 
@@ -584,7 +588,47 @@ function roundToStep(value, step) {
   return rounded.toFixed(precision);
 }
 
-// /suggest <symbol> [target%] [stoploss%] - proposes a leveraged long trade, waits for explicit confirmation
+// Picks LONG or SHORT automatically based on RSI zone (per agreed rule):
+// Overbought -> SHORT (bet price falls back), Oversold -> LONG (bet price recovers),
+// Neutral -> defaults to LONG (no strong signal either way).
+function pickSideFromRSI(rsi) {
+  if (rsi !== null && rsi >= 70) return 'Sell';
+  return 'Buy';
+}
+
+// Computes take-profit/stop-loss/liquidation prices correctly for either direction.
+function computeTradeLevels(currentPrice, side, targetPct, stopLossPct, leverage) {
+  if (side === 'Buy') {
+    return {
+      targetPrice: currentPrice * (1 + targetPct / leverage / 100),
+      stopLossPrice: currentPrice * (1 - stopLossPct / leverage / 100),
+      liquidationPrice: currentPrice * (1 - 1 / leverage),
+    };
+  }
+  // Sell/short: profit when price falls, loss when price rises
+  return {
+    targetPrice: currentPrice * (1 - targetPct / leverage / 100),
+    stopLossPrice: currentPrice * (1 + stopLossPct / leverage / 100),
+    liquidationPrice: currentPrice * (1 + 1 / leverage),
+  };
+}
+
+function formatSuggestionMessage(base, side, rsi, currentPrice, targetPct, stopLossPct, leverage, levels) {
+  const sideLabel = side === 'Buy' ? 'LONG' : 'SHORT';
+  return (
+    `💡 Trade suggestion: ${base} ${sideLabel}\n\n` +
+    `${interpretRSI(rsi)}\n\n` +
+    `Entry (approx): $${currentPrice.toLocaleString()}\n` +
+    `Leverage: ${leverage}x\n` +
+    `Margin: 10% of account equity\n` +
+    `Take-profit: ${targetPct}% → approx $${levels.targetPrice.toLocaleString()}\n` +
+    `Stop-loss: -${stopLossPct}% of margin → approx $${levels.stopLossPrice.toLocaleString()}\n` +
+    `(Full liquidation would happen around $${levels.liquidationPrice.toLocaleString()} — the stop-loss is set to close you out well before that)\n\n` +
+    `⚠️ This is not financial advice. Nothing happens until you confirm below.`
+  );
+}
+
+// /suggest <symbol> [target%] [stoploss%] - auto-picks LONG or SHORT based on RSI, waits for explicit confirmation
 bot.command('suggest', async (ctx) => {
   const parts = ctx.message.text.split(' ').slice(1);
   const symbol = (parts[0] || '').toUpperCase();
@@ -594,7 +638,7 @@ bot.command('suggest', async (ctx) => {
   const leverage = 10;
 
   if (!symbol) {
-    return ctx.reply('Usage: /suggest <symbol> [target%] [stoploss%]\nExample: /suggest SOL 100 50\n(stoploss% is % of margin you\'re willing to risk, default 50, must be under 100)');
+    return ctx.reply('Usage: /suggest <symbol> [target%] [stoploss%]\nExample: /suggest SOL 100 50\n(stoploss% is % of margin you\'re willing to risk, default 50, must be under 100)\nDirection (LONG/SHORT) is picked automatically based on RSI.');
   }
 
   const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
@@ -612,27 +656,17 @@ bot.command('suggest', async (ctx) => {
     const closes = data.prices.map((p) => p[1]);
     const currentPrice = closes[closes.length - 1];
     const rsi = calculateRSI(closes, 14);
-
-    const targetPrice = currentPrice * (1 + targetPct / leverage / 100);
-    const liquidationPrice = currentPrice * (1 - 1 / leverage);
-    const stopLossPrice = currentPrice * (1 - stopLossPct / leverage / 100);
+    const side = pickSideFromRSI(rsi);
+    const levels = computeTradeLevels(currentPrice, side, targetPct, stopLossPct, leverage);
 
     const suggestion = await pool.query(
-      `INSERT INTO trade_suggestions (chat_id, symbol, target_pct, stop_loss_pct, leverage) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [String(ctx.chat.id), bybitSymbol, targetPct, stopLossPct, leverage]
+      `INSERT INTO trade_suggestions (chat_id, symbol, target_pct, stop_loss_pct, leverage, side) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [String(ctx.chat.id), bybitSymbol, targetPct, stopLossPct, leverage, side]
     );
     const suggestionId = suggestion.rows[0].id;
 
     await ctx.reply(
-      `💡 Trade suggestion: ${base} LONG\n\n` +
-      `${interpretRSI(rsi)}\n\n` +
-      `Entry (approx): $${currentPrice.toLocaleString()}\n` +
-      `Leverage: ${leverage}x\n` +
-      `Margin: 10% of account equity\n` +
-      `Take-profit: ${targetPct}% → approx $${targetPrice.toLocaleString()}\n` +
-      `Stop-loss: -${stopLossPct}% of margin → approx $${stopLossPrice.toLocaleString()}\n` +
-      `(Full liquidation would happen around $${liquidationPrice.toLocaleString()} — the stop-loss is set to close you out well before that)\n\n` +
-      `⚠️ This is not financial advice. Nothing happens until you confirm below.`,
+      formatSuggestionMessage(base, side, rsi, currentPrice, targetPct, stopLossPct, leverage, levels),
       Markup.inlineKeyboard([
         Markup.button.callback('✅ Confirm trade', `confirm_${suggestionId}`),
         Markup.button.callback('❌ Cancel', `cancel_${suggestionId}`),
@@ -666,7 +700,7 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
     await ctx.editMessageReplyMarkup(null);
     await ctx.reply('Placing order on Bybit...');
 
-    const { symbol, target_pct: targetPct, stop_loss_pct: stopLossPct, leverage } = suggestion;
+    const { symbol, target_pct: targetPct, stop_loss_pct: stopLossPct, leverage, side } = suggestion;
 
     // 1. Get current account equity
     const balanceData = await bybitSignedGet('/v5/account/wallet-balance', { accountType: 'UNIFIED' });
@@ -684,6 +718,8 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
     }
     const qtyStep = instrument.lotSizeFilter.qtyStep;
     const minQty = parseFloat(instrument.lotSizeFilter.minOrderQty);
+    // Bybit's standard minimum order VALUE for USDT perpetuals (separate from min quantity)
+    const minOrderValueUsd = parseFloat(instrument.lotSizeFilter.minNotionalValue || 5);
 
     const tickerData = await bybitSignedGet('/v5/market/tickers', { category: 'linear', symbol });
     const currentPrice = parseFloat(tickerData.result?.list?.[0]?.lastPrice);
@@ -694,23 +730,39 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
     const positionValue = marginUsd * leverage;
     let qty = roundToStep(positionValue / currentPrice, qtyStep);
     if (parseFloat(qty) < minQty) {
-      return ctx.reply(`Position size too small for ${symbol}'s minimum order size. Trade not placed. Try a smaller leverage or larger margin.`);
+      return ctx.reply(`Position size too small for ${symbol}'s minimum order quantity. Trade not placed. Try a smaller leverage or larger margin.`);
+    }
+    const actualOrderValue = parseFloat(qty) * currentPrice;
+    if (actualOrderValue < minOrderValueUsd) {
+      return ctx.reply(
+        `Position value ($${actualOrderValue.toFixed(2)}) is below Bybit's $${minOrderValueUsd} minimum order value for ${symbol}. ` +
+        `Trade not placed. Try a larger margin or higher leverage.`
+      );
     }
 
-    // 3. Set leverage for this symbol
+    // 3. Enforce max 2 open positions at a time (part of the agreed risk plan)
+    const positionsData = await bybitSignedGet('/v5/position/list', { category: 'linear', settleCoin: 'USDT' });
+    const openCount = (positionsData.result?.list || []).filter((p) => parseFloat(p.size) > 0).length;
+    if (openCount >= 2) {
+      await pool.query(`UPDATE trade_suggestions SET status = 'cancelled' WHERE id = $1`, [id]);
+      return ctx.reply(`You already have ${openCount} open position(s) — sticking to the 2-trade-at-a-time limit. Close one first (check with /positions) before opening another.`);
+    }
+
+    // 4. Set leverage for this symbol
     await bybitSignedPost('/v5/position/set-leverage', {
       category: 'linear', symbol, buyLeverage: String(leverage), sellLeverage: String(leverage),
     });
 
-    // 4. Place the market order with BOTH take-profit and stop-loss attached
+    // 5. Place the market order with BOTH take-profit and stop-loss attached, correct for LONG or SHORT
     const pricePrecision = instrument.priceFilter?.tickSize?.includes('.') ? instrument.priceFilter.tickSize.split('.')[1].length : 2;
-    const takeProfitPrice = (currentPrice * (1 + targetPct / leverage / 100)).toFixed(pricePrecision);
-    const stopLossPrice = (currentPrice * (1 - stopLossPct / leverage / 100)).toFixed(pricePrecision);
+    const levels = computeTradeLevels(currentPrice, side, targetPct, stopLossPct, leverage);
+    const takeProfitPrice = levels.targetPrice.toFixed(pricePrecision);
+    const stopLossPrice = levels.stopLossPrice.toFixed(pricePrecision);
 
     const orderResult = await bybitSignedPost('/v5/order/create', {
       category: 'linear',
       symbol,
-      side: 'Buy',
+      side,
       orderType: 'Market',
       qty: String(qty),
       takeProfit: String(takeProfitPrice),
@@ -724,9 +776,10 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
     }
 
     await pool.query(`UPDATE trade_suggestions SET status = 'executed' WHERE id = $1`, [id]);
+    const sideLabel = side === 'Buy' ? 'LONG' : 'SHORT';
     ctx.reply(
       `✅ Order placed on Bybit!\n\n` +
-      `${symbol} LONG — ${leverage}x\n` +
+      `${symbol} ${sideLabel} — ${leverage}x\n` +
       `Qty: ${qty}\n` +
       `Margin used: ~$${marginUsd.toFixed(2)}\n` +
       `Take-profit set at: $${takeProfitPrice}\n` +
@@ -767,6 +820,41 @@ bot.command('watchlist', async (ctx) => {
   ctx.reply(`Current auto-watchlist: ${WATCHLIST.join(', ')}`);
 });
 
+// /positions - shows currently open Bybit positions
+bot.command('positions', async (ctx) => {
+  try {
+    await ctx.reply('Checking open positions on Bybit...');
+    const data = await bybitSignedGet('/v5/position/list', { category: 'linear', settleCoin: 'USDT' });
+
+    if (data.retCode !== 0) {
+      return ctx.reply(`Couldn't fetch positions.\nCode: ${data.retCode}\nMessage: ${data.retMsg}`);
+    }
+
+    const openPositions = (data.result?.list || []).filter((p) => parseFloat(p.size) > 0);
+
+    if (openPositions.length === 0) {
+      return ctx.reply('No open positions right now.');
+    }
+
+    const lines = openPositions.map((p) => {
+      const sideLabel = p.side === 'Buy' ? 'LONG' : 'SHORT';
+      const pnl = parseFloat(p.unrealisedPnl);
+      const pnlLabel = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+      return (
+        `${p.symbol} ${sideLabel} — ${p.leverage}x\n` +
+        `  Size: ${p.size} | Entry: $${p.avgPrice}\n` +
+        `  Take-profit: ${p.takeProfit || 'none'} | Stop-loss: ${p.stopLoss || 'none'}\n` +
+        `  Unrealized P&L: ${pnlLabel}`
+      );
+    });
+
+    ctx.reply(`📋 Open positions (${openPositions.length}):\n\n${lines.join('\n\n')}`);
+  } catch (err) {
+    console.error('Positions check error:', err);
+    ctx.reply(`Something went wrong checking positions: ${err.message}`);
+  }
+});
+
 function zoneForRSI(rsi) {
   if (rsi === null) return 'neutral';
   if (rsi >= 70) return 'overbought';
@@ -797,14 +885,30 @@ async function checkWatchlistAlerts() {
 
         // Only alert when actually crossing INTO overbought/oversold, not every check
         if (newZone !== oldZone && (newZone === 'overbought' || newZone === 'oversold')) {
-          const message =
-            `🔔 Watchlist alert: ${base}\n` +
-            `Price: $${currentPrice.toLocaleString()}\n` +
-            `${interpretRSI(rsi)}`;
+          const side = pickSideFromRSI(rsi); // overbought -> Sell, oversold -> Buy
+          const targetPct = 100;
+          const stopLossPct = 50;
+          const leverage = 10;
+          const levels = computeTradeLevels(currentPrice, side, targetPct, stopLossPct, leverage);
+          const bybitSymbol = `${base}USDT`;
+          const messageText = formatSuggestionMessage(base, side, rsi, currentPrice, targetPct, stopLossPct, leverage, levels);
 
           for (const sub of subs.rows) {
             try {
-              await bot.telegram.sendMessage(sub.chat_id, message);
+              const suggestionResult = await pool.query(
+                `INSERT INTO trade_suggestions (chat_id, symbol, target_pct, stop_loss_pct, leverage, side) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+                [sub.chat_id, bybitSymbol, targetPct, stopLossPct, leverage, side]
+              );
+              const suggestionId = suggestionResult.rows[0].id;
+
+              await bot.telegram.sendMessage(
+                sub.chat_id,
+                `🔔 Watchlist alert!\n\n${messageText}`,
+                Markup.inlineKeyboard([
+                  Markup.button.callback('✅ Confirm trade', `confirm_${suggestionId}`),
+                  Markup.button.callback('❌ Cancel', `cancel_${suggestionId}`),
+                ])
+              );
             } catch (sendErr) {
               console.error(`Failed to send alert to ${sub.chat_id}:`, sendErr);
             }
